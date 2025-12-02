@@ -1,189 +1,184 @@
-import os
-import sys
-import time
-
-# 1. AUTO-DOWNLOADER
-def download_file(filename, url):
-    import requests
-    try:
-        r = requests.get(url, allow_redirects=True)
-        with open(filename, 'wb') as f:
-            f.write(r.content)
-    except Exception as e:
-        print(f"Failed to download {filename}. Error: {e}")
-        sys.exit()
-
-# Ensure YOLO files exist
-if not os.path.exists("yolov3-tiny.weights"):
-    download_file("yolov3-tiny.weights", "https://pjreddie.com/media/files/yolov3-tiny.weights")
-
-if not os.path.exists("yolov3-tiny.cfg"):
-    download_file("yolov3-tiny.cfg", "https://github.com/pjreddie/darknet/raw/master/cfg/yolov3-tiny.cfg")
-
-# Ensure gesture model exists
-if not os.path.exists("dhrona_model.h5"):
-    print("Model file 'dhrona_model.h5' missing.")
-    sys.exit()
-
-# 2. IMPORTS
 import cv2
 import mediapipe as mp
 import numpy as np
 import pickle
+import os
+import requests
+import sys
+import time
+from collections import deque, Counter
 from tensorflow.keras.models import load_model
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
-# 3. CONFIGURATION
-CONFIDENCE_THRESHOLD = 0.75
-SKIP_FRAMES = 3
+# --- CONFIGURATION ---
+CONFIDENCE_THRESHOLD = 0.70
+HISTORY_LENGTH = 5
+MOVEMENT_THRESHOLD = 0.005 
+MODEL_OBJ_PATH = 'efficientdet_lite0.tflite'
 
-# COCO class list
-COCO_CLASSES = [
-    "person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck", "boat", "traffic light",
-    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
-    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
-    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "sofa",
-    "pottedplant", "bed", "diningtable", "toilet", "tvmonitor", "laptop", "mouse", "remote", "keyboard",
-    "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors",
-    "teddy bear", "hair drier", "toothbrush"
-]
+# --- 1. MODEL DOWNLOADER ---
+if not os.path.exists(MODEL_OBJ_PATH) or os.path.getsize(MODEL_OBJ_PATH) < 1000:
+    print(f"Downloading Object Model...")
+    try:
+        url = "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite"
+        r = requests.get(url, allow_redirects=True)
+        with open(MODEL_OBJ_PATH, 'wb') as f: f.write(r.content)
+    except: sys.exit("Error: Check internet.")
 
-# 4. LOAD MODELS
-print("Loading Dhrona Brain...")
-model = load_model('dhrona_model.h5')
-with open('scaler.pkl', 'rb') as f: scaler = pickle.load(f)
-with open('encoder.pkl', 'rb') as f: encoder = pickle.load(f)
-
-print("Loading YOLO...")
-yolo_net = cv2.dnn.readNet("yolov3-tiny.weights", "yolov3-tiny.cfg")
-yolo_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-yolo_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-layer_names = yolo_net.getLayerNames()
-output_layers = [layer_names[i - 1] for i in yolo_net.getUnconnectedOutLayers()]
-
-print("Loading MediaPipe...")
-mp_pose = mp.solutions.pose
-# Complexity 0 is faster for Pi else use 1
-pose = mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5, model_complexity=0)
-
-# 5. HELPER FUNCTIONS
-def get_all_objects(frame):
-    h, w = frame.shape[:2]
-    blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), (0,0,0), True, crop=False)
-    yolo_net.setInput(blob)
-    outs = yolo_net.forward(output_layers)
-    
-    detections = []
-    boxes = []
-    confidences = []
-    class_ids = []
-
-    for out in outs:
-        for det in out:
-            scores = det[5:]
-            class_id = np.argmax(scores)
-            confidence = scores[class_id]
-            if confidence > 0.3:
-                cx, cy, bw, bh = (det[0:4] * np.array([w, h, w, h])).astype("int")
-                x = int(cx - bw / 2)
-                y = int(cy - bh / 2)
-                boxes.append([x, y, int(bw), int(bh)])
-                confidences.append(float(confidence))
-                class_ids.append(class_id)
-    
-    indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.3, 0.4)
-    results = []
-    if len(indices) > 0:
-        for i in indices.flatten():
-            results.append((class_ids[i], confidences[i], boxes[i]))
-    return results
-
-# 6. CAMERA SETUP (PI SPECIFIC)
-print("Starting Camera...")
-
-# Use V4L2
-cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-
-# Use lower resolution for better FPS on Pi CPU
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-cap.set(cv2.CAP_PROP_FPS, 30)
-
-if not cap.isOpened():
-    print("Error: Camera not detected.")
-    sys.exit()
-
-print("--- SYSTEM LIVE (HEADLESS MODE) ---")
-
-frame_count = 0
-last_detections = []
-
-# 7. MAIN LOOP
+# --- 2. LOAD BRAIN ---
+print("Loading Dhrona AI...")
 try:
-    while True:
-        ret, frame = cap.read()
-        if not ret: 
-            print("Frame lost.")
-            break
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+    model = load_model('dhrona_model.h5', compile=False)
+    with open('scaler.pkl', 'rb') as f: scaler = pickle.load(f)
+    with open('encoder.pkl', 'rb') as f: encoder = pickle.load(f)
+    print(f"Loaded! Detecting: {encoder.classes_}")
+except:
+    sys.exit("Error: Gesture model files not found.")
+
+# --- 3. INIT VISION ---
+# Pose System
+mp_pose = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils
+pose = mp_pose.Pose(min_detection_confidence=0.5, 
+                    min_tracking_confidence=0.5, 
+                    model_complexity=0)
+
+# Object Detector
+with open(MODEL_OBJ_PATH, 'rb') as f: model_content = f.read()
+base_options = python.BaseOptions(model_asset_buffer=model_content)
+options = vision.ObjectDetectorOptions(base_options=base_options, score_threshold=0.5)
+detector = vision.ObjectDetector.create_from_options(options)
+
+# --- 4. HELPER: MOVEMENT ---
+def calculate_movement(current, previous):
+    if previous is None: return 0.0
+    key_indices = [11, 12, 23, 24, 25, 26]
+    curr_pts = np.array(current).reshape(-1, 4)
+    prev_pts = np.array(previous).reshape(-1, 4)
+    
+    movement = 0.0
+    for i in key_indices:
+        dist = np.linalg.norm(curr_pts[i, :2] - prev_pts[i, :2])
+        movement += dist
+    return movement / len(key_indices)
+
+def get_target_person_crop(detections):
+    largest_area = 0
+    target_box = None
+    for det in detections:
+        if det.categories[0].category_name == 'person':
+            bbox = det.bounding_box
+            area = bbox.width * bbox.height
+            if area > largest_area:
+                largest_area = area
+                target_box = (int(bbox.origin_x), int(bbox.origin_y), 
+                              int(bbox.width), int(bbox.height))
+    return target_box
+
+# --- MAIN LOOP ---
+print("Starting Pi Camera...")
+cap = cv2.VideoCapture(0) # Standard Pi Camera index
+cap.set(3, 640) 
+cap.set(4, 480)
+
+history = deque(maxlen=HISTORY_LENGTH)
+last_label = "Scanning..."
+last_conf = 0.0
+prev_landmarks = None
+
+print("\n--- SYSTEM LIVE (Pi Mode) ---")
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+    
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    
+    # 1. Object Detection
+    detection_result = detector.detect(mp_image)
+    
+    for det in detection_result.detections:
+        bbox = det.bounding_box
+        cat = det.categories[0]
+        color = (0, 255, 0) if cat.category_name == 'person' else (0, 255, 255)
         
-        # Periodic YOLO execution
-        if frame_count % SKIP_FRAMES == 0:
-            last_detections = get_all_objects(frame)
+        cv2.rectangle(frame, (bbox.origin_x, bbox.origin_y), 
+                     (bbox.origin_x + bbox.width, bbox.origin_y + bbox.height), color, 2)
+        cv2.putText(frame, cat.category_name, (bbox.origin_x, bbox.origin_y - 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    # 2. Target Processing
+    target_box = get_target_person_crop(detection_result.detections)
+
+    if target_box:
+        x, y, w, h = target_box
+        h_img, w_img, _ = frame.shape
+        x = max(0, x-20); y = max(0, y-20)
+        w = min(w_img-x, w+40); h = min(h_img-y, h+40)
         
-        frame_count += 1
+        person_crop = frame[y:y+h, x:x+w]
         
-        # Process detections
-        for (class_id, conf, box) in last_detections:
-            x, y, w, h = box
-            label_name = COCO_CLASSES[class_id]
+        if person_crop.size > 0:
+            crop_rgb = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
+            pose_results = pose.process(crop_rgb)
             
-            # A. PERSON DETECTED -> CHECK GESTURE
-            if label_name == "person":
-                # Safe crop
-                x = max(0, x); y = max(0, y)
-                w = min(frame.shape[1]-x, w); h = min(frame.shape[0]-y, h)
-                crop = frame[y:y+h, x:x+w]
+            if pose_results.pose_landmarks:
+                mp_drawing.draw_landmarks(person_crop, pose_results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
                 
-                if crop.size > 0:
-                    # Convert to RGB for MediaPipe
-                    rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-                    results = pose.process(rgb_crop)
+                row = []
+                for lm in pose_results.pose_landmarks.landmark:
+                    row.extend([lm.x, lm.y, lm.z, lm.visibility])
+                
+                # Logic
+                move_score = calculate_movement(row, prev_landmarks)
+                prev_landmarks = row
+                
+                # Predict
+                feat = scaler.transform([row])
+                pred = model.predict(feat, verbose=0)
+                idx = np.argmax(pred)
+                conf = pred[0][idx]
+                label = encoder.classes_[idx]
+                
+                if label == "walk" and move_score < MOVEMENT_THRESHOLD:
+                    label = "stand"
                     
-                    if results.pose_landmarks:
-                        row = []
-                        for lm in results.pose_landmarks.landmark:
-                            row.extend([lm.x, lm.y, lm.z, lm.visibility])
-                        
-                        try:
-                            feat = scaler.transform([row])
-                            pred = model.predict(feat)
-                            idx = np.argmax(pred)
-                            ai_conf = pred[0][idx]
-                            
-                            if ai_conf > CONFIDENCE_THRESHOLD:
-                                gesture_text = encoder.classes_[idx].upper()
-                                
-                                # [PI CHANGE] Action Logic (Instead of Drawing)
-                                if gesture_text in ['ATTENTION', 'SOS']:
-                                    print(f">>> ALERT: SOS Detected! (Conf: {int(ai_conf*100)}%)")
-                                    # TODO: vehicle.mode = VehicleMode("LOITER")
-                                    
-                                elif gesture_text == 'CANCEL':
-                                    print(f">>> INFO: Cancel Signal Received.")
-                                    # TODO: vehicle.mode = VehicleMode("AUTO")
-                                    
-                        except:
-                            pass
-            # B. OBJECT DETECTED
-            else:
-                # [PI CHANGE] Just print important objects found
-                if label_name in ['backpack', 'bottle', 'cell phone']:
-                    print(f">>> OBJECT: {label_name.upper()} found.")
+                if conf > CONFIDENCE_THRESHOLD:
+                    history.append(label)
+                    if label in ['attention', 'sos'] and last_label != label:
+                        print(f">>> EMERGENCY: {label.upper()}")
+                else:
+                    history.append("...")
 
-except KeyboardInterrupt:
-    print("\nStopping...")
+                # Smoothing
+                most_common = Counter(history).most_common(1)[0][0]
+                if most_common != "...":
+                    last_label = most_common
+                    last_conf = conf
+                
+                # Update Visuals
+                frame[y:y+h, x:x+w] = person_crop
+                
+                color = (0, 255, 0)
+                if last_label in ['sos', 'attention']: color = (0, 0, 255)
+                
+                text = f"{last_label.upper()} ({int(last_conf*100)}%)"
+                cv2.putText(frame, text, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-finally:
-    cap.release()
-    print("System Shutdown.")
+    else:
+        history.append("...")
+        last_label = "Scanning..."
+
+    # Top Bar
+    cv2.rectangle(frame, (0,0), (640, 30), (0,0,0), -1)
+    status = f"Status: {last_label.upper()} | Objects: {len(detection_result.detections)}"
+    cv2.putText(frame, status, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+
+    cv2.imshow("Dhrona Pi", frame)
+    if cv2.waitKey(1) == ord('q'): break
+
+cap.release()
+cv2.destroyAllWindows()
